@@ -68,3 +68,6 @@ backup/
 
 # macOS
 .DS_Store
+
+cmake-build-*
+.idea

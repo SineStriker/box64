@@ -40,7 +40,7 @@
 box64context_t *my_context = NULL;
 int box64_quit = 0;
 int box64_log = LOG_INFO; //LOG_NONE;
-int box64_dump = 0;
+int box64_dump = 1;
 int box64_nobanner = 0;
 int box64_dynarec_log = LOG_NONE;
 uintptr_t box64_pagesize;
@@ -1786,6 +1786,8 @@ int main(int argc, const char **argv, char **env) {
     setupTrace();
     // get entrypoint
     my_context->ep = GetEntryPoint(my_context->maplib, elf_header);
+
+     printf("[AAAAAAAAAA] Entry point %lx\n", my_context->ep);
 
     atexit(endBox64);
     loadProtectionFromMap();
