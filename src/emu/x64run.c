@@ -28,6 +28,11 @@
 
 int my_setcontext(x64emu_t* emu, void* ucp);
 
+// Begin Patch
+extern void (*BPEC_Run_func)(x64emu_t *);
+extern int (*BPEC_ShouldRun_func)(size_t);
+// End Patch
+
 #ifdef TEST_INTERPRETER
 int RunTest(x64test_t *test)
 #else
@@ -67,7 +72,7 @@ int Run(x64emu_t *emu, int step)
 
 x64emurun:
 #ifndef TEST_INTERPRETER
-    while(1) 
+    while(1)
 #endif
     {
 #if defined(HAVE_TRACE)
@@ -81,7 +86,7 @@ x64emurun:
         emu->old_ip = addr;
 
         opcode = F8;
-        
+
         rep = 0;
         while((opcode==0xF2) || (opcode==0xF3)) {
             rep = opcode-0xF1;
@@ -96,6 +101,12 @@ x64emurun:
                 rex.rex = opcode;
                 opcode = F8;
             }
+
+        // Begin Patch
+        if (BPEC_ShouldRun_func && BPEC_ShouldRun_func(addr - my_context->ep)) {
+            BPEC_Run_func(emu);
+        }
+        // End Patch
 
         switch(opcode) {
 
@@ -164,7 +175,7 @@ x64emurun:
         case 0x0F:                      /* More instructions */
             switch(rep) {
                 case 1:
-                    #ifdef TEST_INTERPRETER 
+                    #ifdef TEST_INTERPRETER
                     if(!(addr = TestF20F(test, rex, addr, &step)))
                         unimp = 1;
                     #else
@@ -176,7 +187,7 @@ x64emurun:
                     #endif
                     break;
                 case 2:
-                    #ifdef TEST_INTERPRETER 
+                    #ifdef TEST_INTERPRETER
                     if(!(addr = TestF30F(test, rex, addr)))
                         unimp = 1;
                     #else
@@ -187,7 +198,7 @@ x64emurun:
                     #endif
                     break;
                 default:
-                    #ifdef TEST_INTERPRETER 
+                    #ifdef TEST_INTERPRETER
                     if(!(addr = Test0F(test, rex, addr, &step)))
                         unimp = 1;
                     #else
@@ -557,7 +568,7 @@ x64emurun:
             ,   addr += tmp8s;
             ,,STEP2
             )                           /* Jxx Ib */
-        
+
         case 0x82:
             if(!rex.is32bits) {
                 unimp = 1;
@@ -665,7 +676,7 @@ x64emurun:
             EB->byte[0] = tmp8u;
             if(!MODREG)
                 pthread_mutex_unlock(&my_context->mutex_lock);
-#endif                
+#endif
             break;
         case 0x87:                      /* XCHG Ed,Gd */
             nextop = F8;
@@ -1449,7 +1460,7 @@ x64emurun:
                 case 1: EB->byte[0] = ror8(emu, EB->byte[0], tmp8u); break;
                 case 2: EB->byte[0] = rcl8(emu, EB->byte[0], tmp8u); break;
                 case 3: EB->byte[0] = rcr8(emu, EB->byte[0], tmp8u); break;
-                case 4: 
+                case 4:
                 case 6: EB->byte[0] = shl8(emu, EB->byte[0], tmp8u); break;
                 case 5: EB->byte[0] = shr8(emu, EB->byte[0], tmp8u); break;
                 case 7: EB->byte[0] = sar8(emu, EB->byte[0], tmp8u); break;
@@ -1466,7 +1477,7 @@ x64emurun:
                     case 1: ED->q[0] = ror64(emu, ED->q[0], tmp8u); break;
                     case 2: ED->q[0] = rcl64(emu, ED->q[0], tmp8u); break;
                     case 3: ED->q[0] = rcr64(emu, ED->q[0], tmp8u); break;
-                    case 4: 
+                    case 4:
                     case 6: ED->q[0] = shl64(emu, ED->q[0], tmp8u); break;
                     case 5: ED->q[0] = shr64(emu, ED->q[0], tmp8u); break;
                     case 7: ED->q[0] = sar64(emu, ED->q[0], tmp8u); break;
@@ -1478,7 +1489,7 @@ x64emurun:
                         case 1: ED->q[0] = ror32(emu, ED->dword[0], tmp8u); break;
                         case 2: ED->q[0] = rcl32(emu, ED->dword[0], tmp8u); break;
                         case 3: ED->q[0] = rcr32(emu, ED->dword[0], tmp8u); break;
-                        case 4: 
+                        case 4:
                         case 6: ED->q[0] = shl32(emu, ED->dword[0], tmp8u); break;
                         case 5: ED->q[0] = shr32(emu, ED->dword[0], tmp8u); break;
                         case 7: ED->q[0] = sar32(emu, ED->dword[0], tmp8u); break;
@@ -1489,7 +1500,7 @@ x64emurun:
                         case 1: ED->dword[0] = ror32(emu, ED->dword[0], tmp8u); break;
                         case 2: ED->dword[0] = rcl32(emu, ED->dword[0], tmp8u); break;
                         case 3: ED->dword[0] = rcr32(emu, ED->dword[0], tmp8u); break;
-                        case 4: 
+                        case 4:
                         case 6: ED->dword[0] = shl32(emu, ED->dword[0], tmp8u); break;
                         case 5: ED->dword[0] = shr32(emu, ED->dword[0], tmp8u); break;
                         case 7: ED->dword[0] = sar32(emu, ED->dword[0], tmp8u); break;
@@ -1731,7 +1742,7 @@ x64emurun:
             tmp8u = (nextop>>3)&7;
             GETEB((tmp8u<2)?1:0);
             switch(tmp8u) {
-                case 0: 
+                case 0:
                 case 1:                 /* TEST Eb,Ib */
                     tmp8u = F8;
                     test8(emu, EB->byte[0], tmp8u);
@@ -1762,7 +1773,7 @@ x64emurun:
             GETED((tmp8u<2)?4:0);
             if(rex.w) {
                 switch(tmp8u) {
-                    case 0: 
+                    case 0:
                     case 1:                 /* TEST Ed,Id */
                         tmp64u = F32S64;
                         test64(emu, ED->q[0], tmp64u);
@@ -1788,7 +1799,7 @@ x64emurun:
                 }
             } else {
                 switch(tmp8u) {
-                    case 0: 
+                    case 0:
                     case 1:                 /* TEST Ed,Id */
                         tmp32u = F32;
                         test32(emu, ED->dword[0], tmp32u);

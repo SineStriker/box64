@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sys/prctl.h>
 #include <stdarg.h>
+
 #ifdef DYNAREC
 #ifdef ARM64
 #include <linux/auxvec.h>
@@ -40,7 +41,7 @@
 box64context_t *my_context = NULL;
 int box64_quit = 0;
 int box64_log = LOG_INFO; //LOG_NONE;
-int box64_dump = 1;
+int box64_dump = 0;
 int box64_nobanner = 0;
 int box64_dynarec_log = LOG_NONE;
 uintptr_t box64_pagesize;
@@ -119,80 +120,142 @@ int box64_novulkan = 0;
 int box64_showsegv = 0;
 int box64_showbt = 0;
 int box64_isglibc234 = 0;
-char* box64_libGL = NULL;
+char *box64_libGL = NULL;
 uintptr_t fmod_smc_start = 0;
 uintptr_t fmod_smc_end = 0;
 uint32_t default_gs = 0x53;
 int jit_gdb = 0;
 int box64_tcmalloc_minimal = 0;
 
-FILE* ftrace = NULL;
-char* ftrace_name = NULL;
+FILE *ftrace = NULL;
+char *ftrace_name = NULL;
 int ftrace_has_pid = 0;
 
-void openFTrace(const char* newtrace)
-{
-    const char* t = newtrace?newtrace:getenv("BOX64_TRACE_FILE");
+// Begin Patch
+void (*BPEC_Run_func)(x64emu_t *) = NULL;
+
+int (*BPEC_ShouldRun_func)(size_t) = NULL;
+
+#include <dlfcn.h>
+#include <libgen.h>
+
+static int BPEC_init(box64context_t *ctx) {
+    printf("[BPEC] Entry point %lx\n", ctx->ep);
+
+    char *path = ctx->fullpath;
+    char *slash = strrchr(path, '/');
+    if (!slash)
+        return 0;
+
+    char lib_path[PATH_MAX];
+    strcpy(lib_path, path);
+    strcat(lib_path, "_bpec.so");
+
+    char *lib_name = lib_path + (slash - path) + 1;
+
+    printf("[BPEC] Try load %s\n", lib_path);
+    void *handle = dlopen(lib_path, RTLD_NOW);
+    if (!handle) {
+        // Try exe dir
+        char exe_path[PATH_MAX];
+        ssize_t len;
+        len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        exe_path[len] = '\0';
+
+        char *slash2 = strrchr(exe_path, '/');
+        strcpy(slash2 + 1, lib_name);
+
+        printf("[BPEC] Try load %s\n", exe_path);
+        handle = dlopen(exe_path, RTLD_NOW);
+        if (!handle) {
+            printf("[BPEC] Load library failed: %s\n", dlerror());
+            return 0;
+        }
+    }
+
+    void *entry = dlsym(handle, "BPEC_Run");
+    if (!entry) {
+        printf("[BPEC] Symbol `BPEC_Run` not found: %s\n", dlerror());
+        dlclose(handle);
+        return 0;
+    }
+
+    void *table = dlsym(handle, "BPEC_ShouldRun");
+    if (!table) {
+        printf("[BPEC] Symbol `BPEC_ShouldRun` not found: %s\n", dlerror());
+        dlclose(handle);
+        return 0;
+    }
+
+    BPEC_Run_func = (void (*)(x64emu_t *)) entry;
+    BPEC_ShouldRun_func = (int (*)(size_t)) table;
+
+    return 1;
+}
+// End Patch
+
+void openFTrace(const char *newtrace) {
+    const char *t = newtrace ? newtrace : getenv("BOX64_TRACE_FILE");
     char tmp[500];
     char tmp2[500];
-    const char* p = t;
-    int append=0;
-    if(p && strlen(p) && p[strlen(p)-1]=='+') {
+    const char *p = t;
+    int append = 0;
+    if (p && strlen(p) && p[strlen(p) - 1] == '+') {
         strncat(tmp2, t, 499);
-        tmp2[strlen(p)-1]='\0';
+        tmp2[strlen(p) - 1] = '\0';
         p = tmp2;
-        append=1;
+        append = 1;
     }
-    if(p && strstr(t, "%pid")) {
+    if (p && strstr(t, "%pid")) {
         int next = 0;
-        if(!append) do {
-            strcpy(tmp, p);
-            char* c = strstr(tmp, "%pid");
-            *c = 0; // cut
-            char pid[16];
-            if(next)
-                sprintf(pid, "%d-%d", getpid(), next);
-            else
-                sprintf(pid, "%d", getpid());
-            strcat(tmp, pid);
-            c = strstr(p, "%pid") + strlen("%pid");
-            strcat(tmp, c);
-            ++next;
-        } while (FileExist(tmp, IS_FILE));
+        if (!append)
+            do {
+                strcpy(tmp, p);
+                char *c = strstr(tmp, "%pid");
+                *c = 0; // cut
+                char pid[16];
+                if (next)
+                    sprintf(pid, "%d-%d", getpid(), next);
+                else
+                    sprintf(pid, "%d", getpid());
+                strcat(tmp, pid);
+                c = strstr(p, "%pid") + strlen("%pid");
+                strcat(tmp, c);
+                ++next;
+            } while (FileExist(tmp, IS_FILE));
         p = tmp;
         ftrace_has_pid = 1;
     }
-    if(ftrace_name)
+    if (ftrace_name)
         free(ftrace_name);
     ftrace_name = NULL;
-    if(p) {
-        if(!strcmp(p, "stderr"))
+    if (p) {
+        if (!strcmp(p, "stderr"))
             ftrace = stderr;
         else {
-            if(append)
+            if (append)
                 ftrace = fopen(p, "w+");
             else
                 ftrace = fopen(p, "w");
-            if(!ftrace) {
+            if (!ftrace) {
                 ftrace = stdout;
                 printf_log(LOG_INFO, "Cannot open trace file \"%s\" for writing (error=%s)\n", p, strerror(errno));
             } else {
                 ftrace_name = strdup(p);
                 /*fclose(ftrace);
                 ftrace = NULL;*/
-                if(!box64_nobanner)
-                    printf("BOX64 Trace %s to \"%s\"\n", append?"appended":"redirected", p);
+                if (!box64_nobanner)
+                    printf("BOX64 Trace %s to \"%s\"\n", append ? "appended" : "redirected", p);
             }
         }
     }
 }
 
-void printf_ftrace(const char* fmt, ...)
-{
-    if(ftrace_name) {
+void printf_ftrace(const char *fmt, ...) {
+    if (ftrace_name) {
         int fd = fileno(ftrace);
-        if(fd<0 || lseek(fd, 0, SEEK_CUR)==(off_t)-1)
-            ftrace=fopen(ftrace_name, "w+");
+        if (fd < 0 || lseek(fd, 0, SEEK_CUR) == (off_t) -1)
+            ftrace = fopen(ftrace_name, "w+");
     }
 
     va_list args;
@@ -204,18 +267,19 @@ void printf_ftrace(const char* fmt, ...)
     va_end(args);
 }
 
-void my_child_fork()
-{
-    if(ftrace_has_pid) {
+void my_child_fork() {
+    if (ftrace_has_pid) {
         // open a new ftrace...
-        if(!ftrace_name) 
+        if (!ftrace_name)
             fclose(ftrace);
         openFTrace(NULL);
     }
 }
 
-const char* getCpuName();
+const char *getCpuName();
+
 int getNCpu();
+
 #ifdef DYNAREC
 void GatherDynarecExtensions()
 {
@@ -381,69 +445,69 @@ HWCAP2_ECV
 
 
 EXPORTDYN
-void LoadLogEnv()
-{
+void LoadLogEnv() {
     ftrace = stdout;
-    box64_nobanner = isatty(fileno(stdout))?0:1;
+    box64_nobanner = isatty(fileno(stdout)) ? 0 : 1;
     const char *p = getenv("BOX64_NOBANNER");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='1')
-                box64_nobanner = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '1')
+                box64_nobanner = p[0] - '0';
         }
     }
     // grab BOX64_TRACE_FILE envvar, and change %pid to actual pid is present in the name
     openFTrace(NULL);
-    box64_log = ftrace_name?LOG_INFO:(isatty(fileno(stdout))?LOG_INFO:LOG_NONE); //default LOG value different if stdout is redirected or not
+    box64_log = ftrace_name ? LOG_INFO : (isatty(fileno(stdout)) ? LOG_INFO
+                                                                 : LOG_NONE); //default LOG value different if stdout is redirected or not
     p = getenv("BOX64_LOG");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0'+LOG_NONE && p[0]<='0'+LOG_NEVER) {
-                box64_log = p[0]-'0';
-                if(box64_log == LOG_NEVER) {
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' + LOG_NONE && p[0] <= '0' + LOG_NEVER) {
+                box64_log = p[0] - '0';
+                if (box64_log == LOG_NEVER) {
                     --box64_log;
                     box64_dump = 1;
                 }
             }
         } else {
-            if(!strcasecmp(p, "NONE"))
+            if (!strcasecmp(p, "NONE"))
                 box64_log = LOG_NONE;
-            else if(!strcasecmp(p, "INFO"))
+            else if (!strcasecmp(p, "INFO"))
                 box64_log = LOG_INFO;
-            else if(!strcasecmp(p, "DEBUG"))
+            else if (!strcasecmp(p, "DEBUG"))
                 box64_log = LOG_DEBUG;
-            else if(!strcasecmp(p, "DUMP")) {
+            else if (!strcasecmp(p, "DUMP")) {
                 box64_log = LOG_DEBUG;
                 box64_dump = 1;
             }
         }
-        if(!box64_nobanner)
+        if (!box64_nobanner)
             printf_log(LOG_INFO, "Debug level is %d\n", box64_log);
     }
     p = getenv("BOX64_ROLLING_LOG");
-    if(p) {
+    if (p) {
         int cycle = 0;
-        if(sscanf(p, "%d", &cycle)==1)
-                cycle_log = cycle;
-        if(cycle_log==1)
+        if (sscanf(p, "%d", &cycle) == 1)
+            cycle_log = cycle;
+        if (cycle_log == 1)
             cycle_log = 16;
-        if(cycle_log<0)
+        if (cycle_log < 0)
             cycle_log = 0;
-        if(cycle_log && box64_log>LOG_INFO) {
+        if (cycle_log && box64_log > LOG_INFO) {
             cycle_log = 0;
             printf_log(LOG_NONE, "Incompatible Rolling log and Debug Log, disabling Rolling log\n");
         }
     }
-    if(!box64_nobanner && cycle_log)
+    if (!box64_nobanner && cycle_log)
         printf_log(LOG_INFO, "Rolling log, showing last %d function call on signals\n", cycle_log);
     p = getenv("BOX64_DUMP");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='1')
-                box64_dump = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '1')
+                box64_dump = p[0] - '0';
         }
     }
-    if(!box64_nobanner && box64_dump)
+    if (!box64_nobanner && box64_dump)
         printf_log(LOG_INFO, "Elf Dump if ON\n");
 #ifdef DYNAREC
     p = getenv("BOX64_DYNAREC_DUMP");
@@ -692,220 +756,218 @@ void LoadLogEnv()
 #endif
     // Other BOX64 env. var.
     p = getenv("BOX64_LIBCEF");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='1')
-                box64_libcef = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '1')
+                box64_libcef = p[0] - '0';
         }
-        if(!box64_libcef)
+        if (!box64_libcef)
             printf_log(LOG_INFO, "Dynarec will not detect libcef\n");
     }
     p = getenv("BOX64_LOAD_ADDR");
-    if(p) {
-        if(sscanf(p, "0x%zx", &box64_load_addr)!=1)
+    if (p) {
+        if (sscanf(p, "0x%zx", &box64_load_addr) != 1)
             box64_load_addr = 0;
-        if(box64_load_addr)
-            printf_log(LOG_INFO, "Use a starting load address of %p\n", (void*)box64_load_addr);
+        if (box64_load_addr)
+            printf_log(LOG_INFO, "Use a starting load address of %p\n", (void *) box64_load_addr);
     }
     p = getenv("BOX64_DLSYM_ERROR");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                dlsym_error = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                dlsym_error = p[0] - '0';
         }
     }
     p = getenv("BOX64_X11THREADS");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_x11threads = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_x11threads = p[0] - '0';
         }
-        if(box64_x11threads)
+        if (box64_x11threads)
             printf_log(LOG_INFO, "Try to Call XInitThreads if libX11 is loaded\n");
     }
     p = getenv("BOX64_X11GLX");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_x11glx = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_x11glx = p[0] - '0';
         }
-        if(box64_x11glx)
+        if (box64_x11glx)
             printf_log(LOG_INFO, "Hack to force libX11 GLX extension present\n");
         else
             printf_log(LOG_INFO, "Disabled Hack to force libX11 GLX extension present\n");
     }
     p = getenv("BOX64_LIBGL");
-    if(p)
+    if (p)
         box64_libGL = box_strdup(p);
-    if(!box64_libGL) {
+    if (!box64_libGL) {
         p = getenv("SDL_VIDEO_GL_DRIVER");
-        if(p)
+        if (p)
             box64_libGL = box_strdup(p);
     }
-    if(box64_libGL) {
+    if (box64_libGL) {
         printf_log(LOG_INFO, "BOX64 using \"%s\" as libGL.so.1\n", p);
     }
     p = getenv("BOX64_ALLOWMISSINGLIBS");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                allow_missing_libs = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                allow_missing_libs = p[0] - '0';
         }
-        if(allow_missing_libs)
+        if (allow_missing_libs)
             printf_log(LOG_INFO, "Allow missing needed libs\n");
     }
     p = getenv("BOX64_CRASHHANDLER");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_dummy_crashhandler = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_dummy_crashhandler = p[0] - '0';
         }
-        if(!box64_dummy_crashhandler)
+        if (!box64_dummy_crashhandler)
             printf_log(LOG_INFO, "Don't use dummy crashhandler lib\n");
     }
     p = getenv("BOX64_MALLOC_HACK");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+2)
-                box64_malloc_hack = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 2)
+                box64_malloc_hack = p[0] - '0';
         }
-        if(!box64_malloc_hack) {
-            if(box64_malloc_hack==1) {
+        if (!box64_malloc_hack) {
+            if (box64_malloc_hack == 1) {
                 printf_log(LOG_INFO, "Malloc hook will not be redirected\n");
             } else
                 printf_log(LOG_INFO, "Malloc hook will check for mmap/free occurrences\n");
         }
     }
     p = getenv("BOX64_NOPULSE");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_nopulse = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_nopulse = p[0] - '0';
         }
-        if(box64_nopulse)
+        if (box64_nopulse)
             printf_log(LOG_INFO, "Disable the use of pulseaudio libs\n");
     }
     p = getenv("BOX64_NOGTK");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_nogtk = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_nogtk = p[0] - '0';
         }
-        if(box64_nogtk)
+        if (box64_nogtk)
             printf_log(LOG_INFO, "Disable the use of wrapped gtk libs\n");
     }
     p = getenv("BOX64_NOVULKAN");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_novulkan = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_novulkan = p[0] - '0';
         }
-        if(box64_novulkan)
+        if (box64_novulkan)
             printf_log(LOG_INFO, "Disable the use of wrapped vulkan libs\n");
     }
     p = getenv("BOX64_FIX_64BIT_INODES");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                fix_64bit_inodes = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                fix_64bit_inodes = p[0] - '0';
         }
-        if(fix_64bit_inodes)
+        if (fix_64bit_inodes)
             printf_log(LOG_INFO, "Fix 64bit inodes\n");
     }
     p = getenv("BOX64_JITGDB");
-    if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+2)
-                jit_gdb = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 2)
+                jit_gdb = p[0] - '0';
         }
-        if(jit_gdb)
-            printf_log(LOG_INFO, "Launch %s on segfault\n", (jit_gdb==2)?"gdbserver":"gdb");
+        if (jit_gdb)
+            printf_log(LOG_INFO, "Launch %s on segfault\n", (jit_gdb == 2) ? "gdbserver" : "gdb");
     }
     p = getenv("BOX64_SHOWSEGV");
-        if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_showsegv = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_showsegv = p[0] - '0';
         }
-        if(box64_showsegv)
+        if (box64_showsegv)
             printf_log(LOG_INFO, "Show Segfault signal even if a signal handler is present\n");
     }
     p = getenv("BOX64_SHOWBT");
-        if(p) {
-        if(strlen(p)==1) {
-            if(p[0]>='0' && p[0]<='0'+1)
-                box64_showbt = p[0]-'0';
+    if (p) {
+        if (strlen(p) == 1) {
+            if (p[0] >= '0' && p[0] <= '0' + 1)
+                box64_showbt = p[0] - '0';
         }
-        if(box64_showbt)
+        if (box64_showbt)
             printf_log(LOG_INFO, "Show a Backtrace when a Segfault signal is caught\n");
     }
     box64_pagesize = sysconf(_SC_PAGESIZE);
-    if(!box64_pagesize)
+    if (!box64_pagesize)
         box64_pagesize = 4096;
 #ifdef DYNAREC
     GatherDynarecExtensions();
 #endif
     int ncpu = getNCpu();
-    const char* cpuname = getCpuName();
+    const char *cpuname = getCpuName();
     printf_log(LOG_INFO, "Running on %s with %d Cores\n", cpuname, ncpu);
 }
 
 EXPORTDYN
-void LoadEnvPath(path_collection_t *col, const char* defpath, const char* env)
-{
-    const char* p = getenv(env);
-    if(p) {
+void LoadEnvPath(path_collection_t *col, const char *defpath, const char *env) {
+    const char *p = getenv(env);
+    if (p) {
         printf_log(LOG_INFO, "%s: ", env);
         ParseList(p, col, 1);
     } else {
         printf_log(LOG_INFO, "Using default %s: ", env);
         ParseList(defpath, col, 1);
     }
-    if(LOG_INFO<=box64_log) {
-        for(int i=0; i<col->size; i++)
-            printf_log(LOG_INFO, "%s%s", col->paths[i], (i==col->size-1)?"\n":":");
+    if (LOG_INFO <= box64_log) {
+        for (int i = 0; i < col->size; i++)
+            printf_log(LOG_INFO, "%s%s", col->paths[i], (i == col->size - 1) ? "\n" : ":");
     }
 }
 
 EXPORTDYN
-int CountEnv(char** env)
-{
+int CountEnv(char **env) {
     // count, but remove all BOX64_* environnement
     // also remove PATH and LD_LIBRARY_PATH
     // but add 2 for default BOX64_PATH and BOX64_LD_LIBRARY_PATH
-    char** p = env;
+    char **p = env;
     int c = 0;
-    while(*p) {
-        if(strncmp(*p, "BOX64_", 6)!=0)
+    while (*p) {
+        if (strncmp(*p, "BOX64_", 6) != 0)
             //if(!(strncmp(*p, "PATH=", 5)==0 || strncmp(*p, "LD_LIBRARY_PATH=", 16)==0))
-                ++c;
+            ++c;
         ++p;
     }
-    return c+2;
+    return c + 2;
 }
+
 EXPORTDYN
-int GatherEnv(char*** dest, char** env, char* prog)
-{
+int GatherEnv(char ***dest, char **env, char *prog) {
     // Add all but BOX64_* environnement
     // but add 2 for default BOX64_PATH and BOX64_LD_LIBRARY_PATH
-    char** p = env;    
+    char **p = env;
     int idx = 0;
     int path = 0;
     int ld_path = 0;
-    while(*p) {
-        if(strncmp(*p, "BOX64_PATH=", 11)==0) {
-            (*dest)[idx++] = box_strdup(*p+6);
+    while (*p) {
+        if (strncmp(*p, "BOX64_PATH=", 11) == 0) {
+            (*dest)[idx++] = box_strdup(*p + 6);
             path = 1;
-        } else if(strncmp(*p, "BOX64_LD_LIBRARY_PATH=", 22)==0) {
-            (*dest)[idx++] = box_strdup(*p+6);
+        } else if (strncmp(*p, "BOX64_LD_LIBRARY_PATH=", 22) == 0) {
+            (*dest)[idx++] = box_strdup(*p + 6);
             ld_path = 1;
-        } else if(strncmp(*p, "_=", 2)==0) {
+        } else if (strncmp(*p, "_=", 2) == 0) {
             /*int l = strlen(prog);
             char tmp[l+3];
             strcpy(tmp, "_=");
             strcat(tmp, prog);
             (*dest)[idx++] = box_strdup(tmp);*/
-        } else if(strncmp(*p, "BOX64_", 6)!=0) {
+        } else if (strncmp(*p, "BOX64_", 6) != 0) {
             (*dest)[idx++] = box_strdup(*p);
             /*if(!(strncmp(*p, "PATH=", 5)==0 || strncmp(*p, "LD_LIBRARY_PATH=", 16)==0)) {
             }*/
@@ -913,16 +975,16 @@ int GatherEnv(char*** dest, char** env, char* prog)
         ++p;
     }
     // update the calloc of envv when adding new variables here
-    if(!path) {
+    if (!path) {
         (*dest)[idx++] = box_strdup("BOX64_PATH=.:bin");
     }
-    if(!ld_path) {
+    if (!ld_path) {
         (*dest)[idx++] = box_strdup("BOX64_LD_LIBRARY_PATH=.:lib:lib64:x86_64:bin64:libs64");
     }
     // add "_=prog" at the end...
-    if(prog) {
+    if (prog) {
         int l = strlen(prog);
-        char tmp[l+3];
+        char tmp[l + 3];
         strcpy(tmp, "_=");
         strcat(tmp, prog);
         (*dest)[idx++] = box_strdup(tmp);
@@ -985,58 +1047,57 @@ void PrintHelp() {
     printf(" BOX64_JITGDB with 1 to launch \"gdb\" when a segfault is trapped, attached to the offending process\n");
 }
 
-void addNewEnvVar(const char* s)
-{
-    if(!s)
+void addNewEnvVar(const char *s) {
+    if (!s)
         return;
-    char* p = box_strdup(s);
-    char* e = strchr(p, '=');
-    if(!e) {
+    char *p = box_strdup(s);
+    char *e = strchr(p, '=');
+    if (!e) {
         printf_log(LOG_INFO, "Invalid specific env. var. '%s'\n", s);
         box_free(p);
         return;
     }
-    *e='\0';
+    *e = '\0';
     ++e;
     setenv(p, e, 1);
     box_free(p);
 }
 
 EXPORTDYN
-void LoadEnvVars(box64context_t *context)
-{
+void LoadEnvVars(box64context_t *context) {
     // Check custom env. var. and add them if needed
     {
-        char* p = getenv("BOX64_ENV");
-        if(p)
+        char *p = getenv("BOX64_ENV");
+        if (p)
             addNewEnvVar(p);
         int i = 1;
         char box64_env[50];
         do {
             sprintf(box64_env, "BOX64_ENV%d", i);
             p = getenv(box64_env);
-            if(p) {
+            if (p) {
                 addNewEnvVar(p);
                 ++i;
             }
-        } while(p);
+        } while (p);
     }
     // check BOX64_LD_LIBRARY_PATH and load it
     LoadEnvPath(&context->box64_ld_lib, ".:lib:lib64:x86_64:bin64:libs64", "BOX64_LD_LIBRARY_PATH");
-    if(FileExist("/lib/x86_64-linux-gnu", 0))
+    if (FileExist("/lib/x86_64-linux-gnu", 0))
         AddPath("/lib/x86_64-linux-gnu", &context->box64_ld_lib, 1);
-    if(FileExist("/usr/lib/x86_64-linux-gnu", 0))
+    if (FileExist("/usr/lib/x86_64-linux-gnu", 0))
         AddPath("/usr/lib/x86_64-linux-gnu", &context->box64_ld_lib, 1);
-    if(FileExist("/usr/x86_64-linux-gnu/lib", 0))
+    if (FileExist("/usr/x86_64-linux-gnu/lib", 0))
         AddPath("/usr/x86_64-linux-gnu/lib", &context->box64_ld_lib, 1);
-    if(getenv("LD_LIBRARY_PATH"))
-        PrependList(&context->box64_ld_lib, getenv("LD_LIBRARY_PATH"), 1);   // in case some of the path are for x86 world
-    if(getenv("BOX64_EMULATED_LIBS")) {
-        char* p = getenv("BOX64_EMULATED_LIBS");
+    if (getenv("LD_LIBRARY_PATH"))
+        PrependList(&context->box64_ld_lib, getenv("LD_LIBRARY_PATH"),
+                    1);   // in case some of the path are for x86 world
+    if (getenv("BOX64_EMULATED_LIBS")) {
+        char *p = getenv("BOX64_EMULATED_LIBS");
         ParseList(p, &context->box64_emulated_libs, 0);
         if (my_context->box64_emulated_libs.size && box64_log) {
             printf_log(LOG_INFO, "BOX64 will force the used of emulated libs for ");
-            for (int i=0; i<context->box64_emulated_libs.size; ++i)
+            for (int i = 0; i < context->box64_emulated_libs.size; ++i)
                 printf_log(LOG_INFO, "%s ", context->box64_emulated_libs.paths[i]);
             printf_log(LOG_INFO, "\n");
         }
@@ -1049,46 +1110,46 @@ void LoadEnvVars(box64context_t *context)
     AddPath("libunwind.so.8", &context->box64_emulated_libs, 0);
     AddPath("libpng12.so.0", &context->box64_emulated_libs, 0);
 
-    if(getenv("BOX64_SSE_FLUSHTO0")) {
-        if (strcmp(getenv("BOX64_SSE_FLUSHTO0"), "1")==0) {
+    if (getenv("BOX64_SSE_FLUSHTO0")) {
+        if (strcmp(getenv("BOX64_SSE_FLUSHTO0"), "1") == 0) {
             box64_sse_flushto0 = 1;
             printf_log(LOG_INFO, "BOX64: Direct apply of SSE Flush to 0 flag\n");
-    	}
+        }
     }
-    if(getenv("BOX64_X87_NO80BITS")) {
-        if (strcmp(getenv("BOX64_X87_NO80BITS"), "1")==0) {
+    if (getenv("BOX64_X87_NO80BITS")) {
+        if (strcmp(getenv("BOX64_X87_NO80BITS"), "1") == 0) {
             box64_x87_no80bits = 1;
             printf_log(LOG_INFO, "BOX64: all 80bits x87 long double will be handle as double\n");
-    	}
+        }
     }
-    if(getenv("BOX64_PREFER_WRAPPED")) {
-        if (strcmp(getenv("BOX64_PREFER_WRAPPED"), "1")==0) {
+    if (getenv("BOX64_PREFER_WRAPPED")) {
+        if (strcmp(getenv("BOX64_PREFER_WRAPPED"), "1") == 0) {
             box64_prefer_wrapped = 1;
             printf_log(LOG_INFO, "BOX64: Prefer Wrapped libs\n");
-    	}
+        }
     }
-    if(getenv("BOX64_PREFER_EMULATED")) {
-        if (strcmp(getenv("BOX64_PREFER_EMULATED"), "1")==0) {
+    if (getenv("BOX64_PREFER_EMULATED")) {
+        if (strcmp(getenv("BOX64_PREFER_EMULATED"), "1") == 0) {
             box64_prefer_emulated = 1;
             printf_log(LOG_INFO, "BOX64: Prefer Emulated libs\n");
-    	}
+        }
     }
 
-    if(getenv("BOX64_NOSIGSEGV")) {
-        if (strcmp(getenv("BOX64_NOSIGSEGV"), "1")==0) {
+    if (getenv("BOX64_NOSIGSEGV")) {
+        if (strcmp(getenv("BOX64_NOSIGSEGV"), "1") == 0) {
             context->no_sigsegv = 1;
             printf_log(LOG_INFO, "BOX64: Disabling handling of SigSEGV\n");
         }
     }
-    if(getenv("BOX64_NOSIGILL")) {
-        if (strcmp(getenv("BOX64_NOSIGILL"), "1")==0) {
+    if (getenv("BOX64_NOSIGILL")) {
+        if (strcmp(getenv("BOX64_NOSIGILL"), "1") == 0) {
             context->no_sigill = 1;
             printf_log(LOG_INFO, "BOX64: Disabling handling of SigILL\n");
         }
     }
     // check BOX64_PATH and load it
     LoadEnvPath(&context->box64_path, ".:bin", "BOX64_PATH");
-    if(getenv("PATH"))
+    if (getenv("PATH"))
         AppendList(&context->box64_path, getenv("PATH"), 1);   // in case some of the path are for x86 world
 #ifdef HAVE_TRACE
     char* p = getenv("BOX64_TRACE");
@@ -1116,8 +1177,7 @@ void LoadEnvVars(box64context_t *context)
 }
 
 EXPORTDYN
-void setupTraceInit()
-{
+void setupTraceInit() {
 #ifdef HAVE_TRACE
     char* p = trace_init;
     if(p) {
@@ -1154,8 +1214,7 @@ void setupTraceInit()
 }
 
 EXPORTDYN
-void setupTrace()
-{
+void setupTrace() {
 #ifdef HAVE_TRACE
     char* p = box64_trace;
     if(p) {
@@ -1194,15 +1253,15 @@ void setupTrace()
     }
 #endif
 }
+
 void endMallocHook();
 
-void endBox64()
-{
-    if(!my_context || box64_quit)
+void endBox64() {
+    if (!my_context || box64_quit)
         return;
-    
+
     endMallocHook();
-    x64emu_t* emu = thread_get_emu();
+    x64emu_t *emu = thread_get_emu();
     // atexit first
     printf_log(LOG_DEBUG, "Calling atexit registered functions (exiting box64)\n");
     CallAllCleanup(emu);
@@ -1212,7 +1271,7 @@ void endBox64()
     RunElfFini(my_context->elfs[0], emu);
     FreeLibrarian(&my_context->local_maplib, emu);    // unload all libs
     FreeLibrarian(&my_context->maplib, emu);    // unload all libs
-    #if 0
+#if 0
     // waiting for all thread except this one to finish
     int this_thread = GetTID();
     int pid = getpid();
@@ -1250,72 +1309,71 @@ void endBox64()
             closedir(proc_dir);
         }
     }
-    #endif
+#endif
     // all done, free context
     FreeBox64Context(&my_context);
-    #ifdef DYNAREC
+#ifdef DYNAREC
     // disable dynarec now
     box64_dynarec = 0;
-    #endif
-    if(box64_libGL) {
+#endif
+    if (box64_libGL) {
         box_free(box64_libGL);
         box64_libGL = NULL;
     }
 }
 
 
-static void free_contextargv()
-{
-    for(int i=0; i<my_context->argc; ++i)
+static void free_contextargv() {
+    for (int i = 0; i < my_context->argc; ++i)
         box_free(my_context->argv[i]);
 }
 
-static void load_rcfiles()
-{
-    if(FileExist("/etc/box64.box64rc", IS_FILE))
+static void load_rcfiles() {
+    if (FileExist("/etc/box64.box64rc", IS_FILE))
         LoadRCFile("/etc/box64.box64rc");
     else
         LoadRCFile(NULL);   // load default rcfile
-    char* p = getenv("HOME");
-    if(p) {
+    char *p = getenv("HOME");
+    if (p) {
         char tmp[4096];
         strncpy(tmp, p, 4095);
         strncat(tmp, "/.box64rc", 4095);
-        if(FileExist(tmp, IS_FILE))
+        if (FileExist(tmp, IS_FILE))
             LoadRCFile(tmp);
     }
 }
 
-void pressure_vessel(int argc, const char** argv, int nextarg);
-extern char** environ;
+void pressure_vessel(int argc, const char **argv, int nextarg);
+
+extern char **environ;
+
 int main(int argc, const char **argv, char **env) {
     init_malloc_hook();
-    init_auxval(argc, argv, environ?environ:env);
+    init_auxval(argc, argv, environ ? environ : env);
     // trying to open and load 1st arg
-    if(argc==1) {
+    if (argc == 1) {
         PrintBox64Version();
         PrintHelp();
         return 1;
     }
-    if(argc>1 && !strcmp(argv[1], "/usr/bin/gdb") && getenv("BOX64_TRACE_FILE"))
+    if (argc > 1 && !strcmp(argv[1], "/usr/bin/gdb") && getenv("BOX64_TRACE_FILE"))
         exit(0);
     // uname -m is redirected to box64 -m
-    if(argc==2 && (!strcmp(argv[1], "-m") || !strcmp(argv[1], "-p") || !strcmp(argv[1], "-i")))
-    {
+    if (argc == 2 && (!strcmp(argv[1], "-m") || !strcmp(argv[1], "-p") || !strcmp(argv[1], "-i"))) {
         printf("x86_64\n");
         exit(0);
     }
 
     // check BOX64_LOG debug level
     LoadLogEnv();
-    if(!getenv("BOX64_NORCFILES")) {
+    if (!getenv("BOX64_NORCFILES")) {
         load_rcfiles();
     }
-    char* bashpath = NULL;
+    char *bashpath = NULL;
     {
-        char* p = getenv("BOX64_BASH");
-        if(p) {
-            if(FileIsX64ELF(p)) {
+        char *p = getenv("BOX64_BASH");
+        if (p) {
+            if (FileIsX64ELF(p)) {
                 bashpath = p;
                 printf_log(LOG_INFO, "Using bash \"%s\"\n", bashpath);
             } else {
@@ -1323,66 +1381,66 @@ int main(int argc, const char **argv, char **env) {
             }
         }
     }
-    
-    const char* prog = argv[1];
+
+    const char *prog = argv[1];
     int nextarg = 1;
     // check if some options are passed
-    while(prog && prog[0]=='-') {
-        if(!strcmp(prog, "-v") || !strcmp(prog, "--version")) {
+    while (prog && prog[0] == '-') {
+        if (!strcmp(prog, "-v") || !strcmp(prog, "--version")) {
             PrintBox64Version();
             exit(0);
         }
-        if(!strcmp(prog, "-h") || !strcmp(prog, "--help")) {
+        if (!strcmp(prog, "-h") || !strcmp(prog, "--help")) {
             PrintHelp();
             exit(0);
         }
         // other options?
-        if(!strcmp(prog, "--")) {
+        if (!strcmp(prog, "--")) {
             prog = argv[++nextarg];
             break;
         }
         printf("Warning, unrecognized option '%s'\n", prog);
         prog = argv[++nextarg];
     }
-    if(!prog || nextarg==argc) {
+    if (!prog || nextarg == argc) {
         printf("Box64: nothing to run\n");
         exit(0);
     }
-    if(!box64_nobanner)
+    if (!box64_nobanner)
         PrintBox64Version();
     // precheck, for win-preload
-    if(strstr(prog, "wine-preloader")==(prog+strlen(prog)-strlen("wine-preloader")) 
-     || strstr(prog, "wine64-preloader")==(prog+strlen(prog)-strlen("wine64-preloader"))) {
+    if (strstr(prog, "wine-preloader") == (prog + strlen(prog) - strlen("wine-preloader"))
+        || strstr(prog, "wine64-preloader") == (prog + strlen(prog) - strlen("wine64-preloader"))) {
         // wine-preloader detecter, skipping it if next arg exist and is an x86 binary
-        int x64 = (nextarg<argc)?FileIsX64ELF(argv[nextarg]):0;
-        if(x64) {
+        int x64 = (nextarg < argc) ? FileIsX64ELF(argv[nextarg]) : 0;
+        if (x64) {
             prog = argv[++nextarg];
             printf_log(LOG_INFO, "BOX64: Wine preloader detected, loading \"%s\" directly\n", prog);
             //wine_preloaded = 1;
         }
     }
-    #if 1
+#if 1
     // pre-check for pressure-vessel-wrap
-    if(strstr(prog, "pressure-vessel-wrap")==(prog+strlen(prog)-strlen("pressure-vessel-wrap"))) {
+    if (strstr(prog, "pressure-vessel-wrap") == (prog + strlen(prog) - strlen("pressure-vessel-wrap"))) {
         // pressure-vessel-wrap detecter, skipping it and all -- args until "--" if needed
         printf_log(LOG_INFO, "BOX64: pressure-vessel-wrap detected\n");
-        pressure_vessel(argc, argv, nextarg+1);
+        pressure_vessel(argc, argv, nextarg + 1);
     }
-    #endif
+#endif
     int ld_libs_args = -1;
     // check if this is wine
-    if(!strcmp(prog, "wine64")
-     || !strcmp(prog, "wine64-development") 
-     || !strcmp(prog, "wine") 
-     || (strlen(prog)>5 && !strcmp(prog+strlen(prog)-strlen("/wine"), "/wine"))
-     || (strlen(prog)>7 && !strcmp(prog+strlen(prog)-strlen("/wine64"), "/wine64"))) {
-        const char* prereserve = getenv("WINEPRELOADRESERVE");
-        printf_log(LOG_INFO, "BOX64: Wine64 detected, WINEPRELOADRESERVE=\"%s\"\n", prereserve?prereserve:"");
-        if(wine_preloaded)
+    if (!strcmp(prog, "wine64")
+        || !strcmp(prog, "wine64-development")
+        || !strcmp(prog, "wine")
+        || (strlen(prog) > 5 && !strcmp(prog + strlen(prog) - strlen("/wine"), "/wine"))
+        || (strlen(prog) > 7 && !strcmp(prog + strlen(prog) - strlen("/wine64"), "/wine64"))) {
+        const char *prereserve = getenv("WINEPRELOADRESERVE");
+        printf_log(LOG_INFO, "BOX64: Wine64 detected, WINEPRELOADRESERVE=\"%s\"\n", prereserve ? prereserve : "");
+        if (wine_preloaded)
             wine_prereserve(prereserve);
         // special case for winedbg, doesn't work anyway
-        if(argv[nextarg+1] && strstr(argv[nextarg+1], "winedbg")==argv[nextarg+1]) {
-            if(getenv("BOX64_WINEDBG")) {
+        if (argv[nextarg + 1] && strstr(argv[nextarg + 1], "winedbg") == argv[nextarg + 1]) {
+            if (getenv("BOX64_WINEDBG")) {
                 box64_nobanner = 1;
                 box64_log = 0;
             } else {
@@ -1391,15 +1449,15 @@ int main(int argc, const char **argv, char **env) {
             }
         }
         box64_wine = 1;
-    } else 
-    // check if ld-musl-x86_64.so.1 is used
-    if(strstr(prog, "ld-musl-x86_64.so.1")) {
+    } else
+        // check if ld-musl-x86_64.so.1 is used
+    if (strstr(prog, "ld-musl-x86_64.so.1")) {
         printf_log(LOG_INFO, "BOX64: ld-musl detected, trying to workaround and use system ld-linux\n");
         box64_musl = 1;
         // skip ld-musl and go through args unti "--" is found, handling "--library-path" to add some libs to BOX64_LD_LIBRARY
         ++nextarg;
-        while(strcmp(argv[nextarg], "--")) {
-            if(!strcmp(argv[nextarg], "--library-path")) {
+        while (strcmp(argv[nextarg], "--")) {
+            if (!strcmp(argv[nextarg], "--library-path")) {
                 ++nextarg;
                 ld_libs_args = nextarg;
             }
@@ -1409,10 +1467,11 @@ int main(int argc, const char **argv, char **env) {
         prog = argv[nextarg];
     }
     // check if this is wineserver
-    if(!strcmp(prog, "wineserver") || !strcmp(prog, "wineserver64") || (strlen(prog)>9 && !strcmp(prog+strlen(prog)-strlen("/wineserver"), "/wineserver"))) {
+    if (!strcmp(prog, "wineserver") || !strcmp(prog, "wineserver64") ||
+        (strlen(prog) > 9 && !strcmp(prog + strlen(prog) - strlen("/wineserver"), "/wineserver"))) {
         box64_wine = 1;
     }
-    if(box64_wine) {
+    if (box64_wine) {
         // disabling the use of futex_waitv for now
         setenv("WINEFSYNC", "0", 1);
     }
@@ -1422,46 +1481,46 @@ int main(int argc, const char **argv, char **env) {
     // check BOX64_LD_LIBRARY_PATH and load it
     LoadEnvVars(my_context);
     // Append ld_list if it exist
-    if(ld_libs_args!=-1)
+    if (ld_libs_args != -1)
         PrependList(&my_context->box64_ld_lib, argv[ld_libs_args], 1);
 
     my_context->box64path = ResolveFile(argv[0], &my_context->box64_path);
     // prepare all other env. var
-    my_context->envc = CountEnv(environ?environ:env);
+    my_context->envc = CountEnv(environ ? environ : env);
     printf_log(LOG_INFO, "Counted %d Env var\n", my_context->envc);
     // allocate extra space for new environment variables such as BOX64_PATH
-    my_context->envv = (char**)box_calloc(my_context->envc+4, sizeof(char*));
-    GatherEnv(&my_context->envv, environ?environ:env, my_context->box64path);
-    if(box64_dump || box64_log<=LOG_DEBUG) {
-        for (int i=0; i<my_context->envc; ++i)
+    my_context->envv = (char **) box_calloc(my_context->envc + 4, sizeof(char *));
+    GatherEnv(&my_context->envv, environ ? environ : env, my_context->box64path);
+    if (box64_dump || box64_log <= LOG_DEBUG) {
+        for (int i = 0; i < my_context->envc; ++i)
             printf_dump(LOG_DEBUG, " Env[%02d]: %s\n", i, my_context->envv[i]);
     }
 
     path_collection_t ld_preload = {0};
-    if(getenv("BOX64_LD_PRELOAD")) {
-        char* p = getenv("BOX64_LD_PRELOAD");
+    if (getenv("BOX64_LD_PRELOAD")) {
+        char *p = getenv("BOX64_LD_PRELOAD");
         ParseList(p, &ld_preload, 0);
         if (ld_preload.size && box64_log) {
             printf_log(LOG_INFO, "BOX64 try to Preload ");
-            for (int i=0; i<ld_preload.size; ++i)
+            for (int i = 0; i < ld_preload.size; ++i)
                 printf_log(LOG_INFO, "%s ", ld_preload.paths[i]);
             printf_log(LOG_INFO, "\n");
         }
     } else {
-        if(getenv("LD_PRELOAD")) {
-            char* p = getenv("LD_PRELOAD");
-            if(strstr(p, "libtcmalloc_minimal.so.0"))
+        if (getenv("LD_PRELOAD")) {
+            char *p = getenv("LD_PRELOAD");
+            if (strstr(p, "libtcmalloc_minimal.so.0"))
                 box64_tcmalloc_minimal = 1;
-            if(strstr(p, "libtcmalloc_minimal.so.4"))
+            if (strstr(p, "libtcmalloc_minimal.so.4"))
                 box64_tcmalloc_minimal = 1;
-            if(strstr(p, "libtcmalloc_minimal_debug.so.4"))
+            if (strstr(p, "libtcmalloc_minimal_debug.so.4"))
                 box64_tcmalloc_minimal = 1;
-            if(strstr(p, "libasan.so"))
+            if (strstr(p, "libasan.so"))
                 box64_tcmalloc_minimal = 1; // it seems Address Sanitizer doesn't handle dlsym'd malloc very well
             ParseList(p, &ld_preload, 0);
             if (ld_preload.size && box64_log) {
                 printf_log(LOG_INFO, "BOX64 try to Preload ");
-                for (int i=0; i<ld_preload.size; ++i)
+                for (int i = 0; i < ld_preload.size; ++i)
                     printf_log(LOG_INFO, "%s ", ld_preload.paths[i]);
                 printf_log(LOG_INFO, "\n");
             }
@@ -1473,39 +1532,40 @@ int main(int argc, const char **argv, char **env) {
     // check if box86 is present
     {
         my_context->box86path = box_strdup(my_context->box64path);
-        char* p = strrchr(my_context->box86path, '6');  // get the 6 of box64
-        p[0] = '8'; p[1] = '6'; // change 64 to 86
-        if(!FileExist(my_context->box86path, IS_FILE)) {
+        char *p = strrchr(my_context->box86path, '6');  // get the 6 of box64
+        p[0] = '8';
+        p[1] = '6'; // change 64 to 86
+        if (!FileExist(my_context->box86path, IS_FILE)) {
             box_free(my_context->box86path);
             my_context->box86path = NULL;
         }
     }
-    const char* prgname = strrchr(prog, '/');
-    if(!prgname)
+    const char *prgname = strrchr(prog, '/');
+    if (!prgname)
         prgname = prog;
     else
         ++prgname;
-    if(box64_wine) {
+    if (box64_wine) {
         AddPath("libdl.so.2", &ld_preload, 0);
     }
     // special case for zoom
-    if(strstr(prgname, "zoom")==prgname) {
+    if (strstr(prgname, "zoom") == prgname) {
         printf_log(LOG_INFO, "Zoom detected, trying to use system libturbojpeg if possible\n");
         box64_zoom = 1;
     }
     // special case for bash (add BOX86_NOBANNER=1 if not there)
-    if(!strcmp(prgname, "bash")) {
+    if (!strcmp(prgname, "bash")) {
         printf_log(LOG_INFO, "bash detected, disabling banner\n");
         if (!box64_nobanner) {
             setenv("BOX86_NOBANNER", "1", 0);
             setenv("BOX64_NOBANNER", "1", 0);
         }
         if (!bashpath) {
-            bashpath = (char*)prog;
+            bashpath = (char *) prog;
             setenv("BOX64_BASH", prog, 1);
         }
     }
-    if(bashpath)
+    if (bashpath)
         my_context->bashpath = box_strdup(bashpath);
 
     /*if(strstr(prgname, "awesomium_process")==prgname) {
@@ -1518,45 +1578,44 @@ int main(int argc, const char **argv, char **env) {
     ApplyParams("*");   // [*] is a special setting for all process
     ApplyParams(prgname);
 
-    for(int i=1; i<my_context->argc; ++i) {
-        my_context->argv[i] = box_strdup(argv[i+nextarg]);
+    for (int i = 1; i < my_context->argc; ++i) {
+        my_context->argv[i] = box_strdup(argv[i + nextarg]);
         printf_log(LOG_INFO, "argv[%i]=\"%s\"\n", i, my_context->argv[i]);
     }
-    if(box64_nosandbox)
-    {
+    if (box64_nosandbox) {
         // check if sandbox is already there
         int there = 0;
-        for(int i=1; i<my_context->argc && !there; ++i)
-            if(!strcmp(my_context->argv[i], "--no-sandbox"))
+        for (int i = 1; i < my_context->argc && !there; ++i)
+            if (!strcmp(my_context->argv[i], "--no-sandbox"))
                 there = 1;
-        if(!there) {
-            my_context->argv = (char**)box_realloc(my_context->argv, (my_context->argc+1)*sizeof(char*));
+        if (!there) {
+            my_context->argv = (char **) box_realloc(my_context->argv, (my_context->argc + 1) * sizeof(char *));
             my_context->argv[my_context->argc] = box_strdup("--no-sandbox");
             my_context->argc++;
         }
     }
 
     // check if file exist
-    if(!my_context->argv[0] || !FileExist(my_context->argv[0], IS_FILE)) {
+    if (!my_context->argv[0] || !FileExist(my_context->argv[0], IS_FILE)) {
         printf_log(LOG_NONE, "Error: file is not found (check BOX64_PATH)\n");
         free_contextargv();
         FreeBox64Context(&my_context);
         FreeCollection(&ld_preload);
         return -1;
     }
-    if(!FileExist(my_context->argv[0], IS_FILE|IS_EXECUTABLE)) {
+    if (!FileExist(my_context->argv[0], IS_FILE | IS_EXECUTABLE)) {
         printf_log(LOG_NONE, "Error: %s is not an executable file\n", my_context->argv[0]);
         free_contextargv();
         FreeBox64Context(&my_context);
         FreeCollection(&ld_preload);
         return -1;
     }
-    if(!(my_context->fullpath = box_realpath(my_context->argv[0], NULL)))
+    if (!(my_context->fullpath = box_realpath(my_context->argv[0], NULL)))
         my_context->fullpath = box_strdup(my_context->argv[0]);
-    if(getenv("BOX64_ARG0"))
+    if (getenv("BOX64_ARG0"))
         my_context->argv[0] = box_strdup(getenv("BOX64_ARG0"));
     FILE *f = fopen(my_context->fullpath, "rb");
-    if(!f) {
+    if (!f) {
         printf_log(LOG_NONE, "Error: Cannot open %s\n", my_context->fullpath);
         free_contextargv();
         FreeBox64Context(&my_context);
@@ -1564,33 +1623,34 @@ int main(int argc, const char **argv, char **env) {
         return -1;
     }
     elfheader_t *elf_header = LoadAndCheckElfHeader(f, my_context->fullpath, 1);
-    if(!elf_header) {
-        int x86 = my_context->box86path?FileIsX86ELF(my_context->fullpath):0;
-        int script = my_context->bashpath?FileIsShell(my_context->fullpath):0;
-        printf_log(LOG_NONE, "Error: reading elf header of %s, try to launch %s instead\n", my_context->fullpath, x86?"using box86":(script?"using bash":"natively"));
+    if (!elf_header) {
+        int x86 = my_context->box86path ? FileIsX86ELF(my_context->fullpath) : 0;
+        int script = my_context->bashpath ? FileIsShell(my_context->fullpath) : 0;
+        printf_log(LOG_NONE, "Error: reading elf header of %s, try to launch %s instead\n", my_context->fullpath,
+                   x86 ? "using box86" : (script ? "using bash" : "natively"));
         fclose(f);
         FreeCollection(&ld_preload);
         int ret;
-        if(x86) {
+        if (x86) {
             // duplicate the array and insert 1st arg as box86
-            const char** newargv = (const char**)box_calloc(my_context->argc+2, sizeof(char*));
+            const char **newargv = (const char **) box_calloc(my_context->argc + 2, sizeof(char *));
             newargv[0] = my_context->box86path;
-            for(int i=0; i<my_context->argc; ++i)
-                newargv[i+1] = my_context->argv[i];
-            ret = execvp(newargv[0], (char * const*)newargv);
+            for (int i = 0; i < my_context->argc; ++i)
+                newargv[i + 1] = my_context->argv[i];
+            ret = execvp(newargv[0], (char *const *) newargv);
         } else if (script) {
             // duplicate the array and insert 1st arg as box64, 2nd is bash
-            const char** newargv = (const char**)box_calloc(my_context->argc+3, sizeof(char*));
+            const char **newargv = (const char **) box_calloc(my_context->argc + 3, sizeof(char *));
             newargv[0] = my_context->box64path;
             newargv[1] = my_context->bashpath;
-            for(int i=0; i<my_context->argc; ++i)
-                newargv[i+2] = my_context->argv[i];
-            ret = execvp(newargv[0], (char * const*)newargv);
+            for (int i = 0; i < my_context->argc; ++i)
+                newargv[i + 2] = my_context->argv[i];
+            ret = execvp(newargv[0], (char *const *) newargv);
         } else {
-            const char** newargv = (const char**)box_calloc(my_context->argc+1, sizeof(char*));
-            for(int i=0; i<my_context->argc; ++i)
+            const char **newargv = (const char **) box_calloc(my_context->argc + 1, sizeof(char *));
+            for (int i = 0; i < my_context->argc; ++i)
                 newargv[i] = my_context->argv[i];
-            ret = execvp(newargv[0], (char * const*)newargv);
+            ret = execvp(newargv[0], (char *const *) newargv);
         }
         free_contextargv();
         FreeBox64Context(&my_context);
@@ -1598,7 +1658,7 @@ int main(int argc, const char **argv, char **env) {
     }
     AddElfHeader(my_context, elf_header);
 
-    if(CalcLoadAddr(elf_header)) {
+    if (CalcLoadAddr(elf_header)) {
         printf_log(LOG_NONE, "Error: reading elf header of %s\n", my_context->fullpath);
         fclose(f);
         free_contextargv();
@@ -1607,7 +1667,7 @@ int main(int argc, const char **argv, char **env) {
         return -1;
     }
     // allocate memory
-    if(AllocElfMemory(my_context, elf_header, 1)) {
+    if (AllocElfMemory(my_context, elf_header, 1)) {
         printf_log(LOG_NONE, "Error: allocating memory for elf %s\n", my_context->fullpath);
         fclose(f);
         free_contextargv();
@@ -1616,7 +1676,7 @@ int main(int argc, const char **argv, char **env) {
         return -1;
     }
     // Load elf into memory
-    if(LoadElfMemory(f, my_context, elf_header)) {
+    if (LoadElfMemory(f, my_context, elf_header)) {
         printf_log(LOG_NONE, "Error: loading in memory elf %s\n", my_context->fullpath);
         fclose(f);
         free_contextargv();
@@ -1626,28 +1686,29 @@ int main(int argc, const char **argv, char **env) {
     }
     // can close the file now
     fclose(f);
-    if(ElfCheckIfUseTCMallocMinimal(elf_header)) {
-        if(!box64_tcmalloc_minimal) {
+    if (ElfCheckIfUseTCMallocMinimal(elf_header)) {
+        if (!box64_tcmalloc_minimal) {
             // need to reload with tcmalloc_minimal as a LD_PRELOAD!
             printf_log(LOG_INFO, "BOX64: tcmalloc_minimal.so.4 used, reloading box64 with the lib preladed\n");
             // need to get a new envv variable. so first count it and check if LD_PRELOAD is there
-            int preload=(getenv("LD_PRELOAD"))?1:0;
+            int preload = (getenv("LD_PRELOAD")) ? 1 : 0;
             int nenv = 0;
-            while(env[nenv]) nenv++;
+            while (env[nenv]) nenv++;
             // alloc + "LD_PRELOAD" if needd + last NULL ending
-            char** newenv = (char**)box_calloc(nenv+1+((preload)?0:1), sizeof(char*));
+            char **newenv = (char **) box_calloc(nenv + 1 + ((preload) ? 0 : 1), sizeof(char *));
             // copy strings
-            for (int i=0; i<nenv; ++i)
+            for (int i = 0; i < nenv; ++i)
                 newenv[i] = box_strdup(env[i]);
             // add ld_preload
-            if(preload) {
+            if (preload) {
                 // find the line
                 int l = 0;
-                while(l<nenv) {
-                    if(strstr(newenv[l], "LD_PRELOAD=")==newenv[l]) {
+                while (l < nenv) {
+                    if (strstr(newenv[l], "LD_PRELOAD=") == newenv[l]) {
                         // found it!
                         char *old = newenv[l];
-                        newenv[l] = (char*)box_calloc(strlen(old)+strlen("libtcmalloc_minimal.so.4:")+1, sizeof(char));
+                        newenv[l] = (char *) box_calloc(strlen(old) + strlen("libtcmalloc_minimal.so.4:") + 1,
+                                                        sizeof(char));
                         strcpy(newenv[l], "LD_PRELOAD=libtcmalloc_minimal.so.4:");
                         strcat(newenv[l], old + strlen("LD_PRELOAD="));
                         box_free(old);
@@ -1657,16 +1718,19 @@ int main(int argc, const char **argv, char **env) {
                 }
             } else {
                 //move last one
-                newenv[nenv] = box_strdup(newenv[nenv-1]);
-                box_free(newenv[nenv-1]);
-                newenv[nenv-1] = box_strdup("LD_PRELOAD=libtcmalloc_minimal.so.4");
+                newenv[nenv] = box_strdup(newenv[nenv - 1]);
+                box_free(newenv[nenv - 1]);
+                newenv[nenv - 1] = box_strdup("LD_PRELOAD=libtcmalloc_minimal.so.4");
             }
             // duplicate argv too
-            char** newargv = box_calloc(argc+1, sizeof(char*));
+            char **newargv = box_calloc(argc + 1, sizeof(char *));
             int narg = 0;
-            while(argv[narg]) {newargv[narg] = box_strdup(argv[narg]); narg++;}
+            while (argv[narg]) {
+                newargv[narg] = box_strdup(argv[narg]);
+                narg++;
+            }
             // launch with new env...
-            if(execve(newargv[0], newargv, newenv)<0)
+            if (execve(newargv[0], newargv, newenv) < 0)
                 printf_log(LOG_NONE, "Failed to relaunch, error is %d/%s\n", errno, strerror(errno));
         } else {
             printf_log(LOG_INFO, "BOX64: Using tcmalloc_minimal.so.4, and it's in the LD_PRELOAD command\n");
@@ -1681,28 +1745,28 @@ int main(int argc, const char **argv, char **env) {
 #endif
     // change process name
     {
-        char* p = strrchr(my_context->fullpath, '/');
-        if(p)
+        char *p = strrchr(my_context->fullpath, '/');
+        if (p)
             ++p;
         else
             p = my_context->fullpath;
-        if(prctl(PR_SET_NAME, p)==-1)
+        if (prctl(PR_SET_NAME, p) == -1)
             printf_log(LOG_NONE, "Error setting process name (%s)\n", strerror(errno));
         else
             printf_log(LOG_INFO, "Rename process to \"%s\"\n", p);
         // and now all change the argv (so libs libs mesa find the correct program names)
-        char* endp = (char*)argv[argc-1];
-        while(*endp)
+        char *endp = (char *) argv[argc - 1];
+        while (*endp)
             ++endp;    // find last argv[] address
         uintptr_t diff = prog - argv[0]; // this is the difference we need to compensate
-        for(p=(char*)prog; p<=endp; ++p)
+        for (p = (char *) prog; p <= endp; ++p)
             *(p - diff) = *p;  // copy all element at argv[nextarg] to argv[0]
         memset(endp - diff, 0, diff); // fill reminder with NULL
-        for(int i=nextarg; i<argc; ++i)
+        for (int i = nextarg; i < argc; ++i)
             argv[i] -= diff;    // adjust strings
     }
     // get and alloc stack size and align
-    if(CalcStackSize(my_context)) {
+    if (CalcStackSize(my_context)) {
         printf_log(LOG_NONE, "Error: allocating stack\n");
         free_contextargv();
         FreeBox64Context(&my_context);
@@ -1710,13 +1774,13 @@ int main(int argc, const char **argv, char **env) {
         return -1;
     }
     // init x86_64 emu
-    x64emu_t *emu = NewX64Emu(my_context, my_context->ep, (uintptr_t)my_context->stack, my_context->stacksz, 0);
+    x64emu_t *emu = NewX64Emu(my_context, my_context->ep, (uintptr_t) my_context->stack, my_context->stacksz, 0);
     // stack setup is much more complicated then just that!
     SetupInitialStack(emu); // starting here, the argv[] don't need free anymore
     SetupX64Emu(emu, NULL);
     SetRSI(emu, my_context->argc);
-    SetRDX(emu, (uint64_t)my_context->argv);
-    SetRCX(emu, (uint64_t)my_context->envv);
+    SetRDX(emu, (uint64_t) my_context->argv);
+    SetRCX(emu, (uint64_t) my_context->envv);
     SetRBP(emu, 0); // Frame pointer so to "No more frame pointer"
 
     // child fork to handle traces
@@ -1725,35 +1789,36 @@ int main(int argc, const char **argv, char **env) {
     thread_set_emu(emu);
 
     // export symbols
-    AddSymbols(my_context->maplib, GetMapSymbols(elf_header), GetWeakSymbols(elf_header), GetLocalSymbols(elf_header), elf_header);
-    box64_isglibc234 = GetVersionIndice(elf_header, "GLIBC_2.34")?1:0;
-    if(box64_isglibc234)
+    AddSymbols(my_context->maplib, GetMapSymbols(elf_header), GetWeakSymbols(elf_header), GetLocalSymbols(elf_header),
+               elf_header);
+    box64_isglibc234 = GetVersionIndice(elf_header, "GLIBC_2.34") ? 1 : 0;
+    if (box64_isglibc234)
         printf_log(LOG_DEBUG, "Program linked with GLIBC 2.34+\n");
-    if(wine_preloaded) {
+    if (wine_preloaded) {
         uintptr_t wineinfo = FindSymbol(GetMapSymbols(elf_header), "wine_main_preload_info", -1, NULL, 1, NULL);
-        if(!wineinfo) wineinfo = FindSymbol(GetWeakSymbols(elf_header), "wine_main_preload_info", -1, NULL, 1, NULL);
-        if(!wineinfo) wineinfo = FindSymbol(GetLocalSymbols(elf_header), "wine_main_preload_info", -1, NULL, 1, NULL);
-        if(!wineinfo) {printf_log(LOG_NONE, "Warning, Symbol wine_main_preload_info not found\n");}
+        if (!wineinfo) wineinfo = FindSymbol(GetWeakSymbols(elf_header), "wine_main_preload_info", -1, NULL, 1, NULL);
+        if (!wineinfo) wineinfo = FindSymbol(GetLocalSymbols(elf_header), "wine_main_preload_info", -1, NULL, 1, NULL);
+        if (!wineinfo) { printf_log(LOG_NONE, "Warning, Symbol wine_main_preload_info not found\n"); }
         else {
-            *(void**)wineinfo = get_wine_prereserve();
+            *(void **) wineinfo = get_wine_prereserve();
             printf_log(LOG_DEBUG, "WINE wine_main_preload_info found and updated\n");
         }
-        #ifdef DYNAREC
+#ifdef DYNAREC
         dynarec_wine_prereserve();
-        #endif
+#endif
     }
     AddMainElfToLinkmap(elf_header);
     // pre-load lib if needed
-    if(ld_preload.size) {
+    if (ld_preload.size) {
         my_context->preload = new_neededlib(0);
-        for(int i=0; i<ld_preload.size; ++i) {
-            needed_libs_t* tmp = new_neededlib(1);
+        for (int i = 0; i < ld_preload.size; ++i) {
+            needed_libs_t *tmp = new_neededlib(1);
             tmp->names[0] = ld_preload.paths[i];
-            if(AddNeededLib(my_context->maplib, 0, 0, tmp, elf_header, my_context, emu)) {
+            if (AddNeededLib(my_context->maplib, 0, 0, tmp, elf_header, my_context, emu)) {
                 printf_log(LOG_INFO, "Warning, cannot pre-load of %s\n", tmp->names[0]);
                 RemoveNeededLib(my_context->maplib, 0, tmp, my_context, emu);
             } else {
-                for(int j=0; j<tmp->size; ++j)
+                for (int j = 0; j < tmp->size; ++j)
                     add1lib_neededlib(my_context->preload, tmp->libs[j], tmp->names[j]);
                 free_neededlib(tmp);
             }
@@ -1761,14 +1826,14 @@ int main(int argc, const char **argv, char **env) {
     }
     FreeCollection(&ld_preload);
     // Call librarian to load all dependant elf
-    if(LoadNeededLibs(elf_header, my_context->maplib, 0, 0, my_context, emu)) {
+    if (LoadNeededLibs(elf_header, my_context->maplib, 0, 0, my_context, emu)) {
         printf_log(LOG_NONE, "Error: loading needed libs in elf %s\n", my_context->argv[0]);
         FreeBox64Context(&my_context);
         return -1;
     }
     // reloc...
     printf_log(LOG_DEBUG, "And now export symbols / relocation for %s...\n", ElfName(elf_header));
-    if(RelocateElf(my_context->maplib, NULL, 0, elf_header)) {
+    if (RelocateElf(my_context->maplib, NULL, 0, elf_header)) {
         printf_log(LOG_NONE, "Error: relocating symbols in elf %s\n", my_context->argv[0]);
         FreeBox64Context(&my_context);
         return -1;
@@ -1787,10 +1852,14 @@ int main(int argc, const char **argv, char **env) {
     // get entrypoint
     my_context->ep = GetEntryPoint(my_context->maplib, elf_header);
 
-     printf("[AAAAAAAAAA] Entry point %lx\n", my_context->ep);
-
     atexit(endBox64);
     loadProtectionFromMap();
+
+    // Begin Patch
+    if (BPEC_init(my_context)) {
+        printf("[BPEC] Load library successfully, entry %p\n", BPEC_Run_func);
+    }
+    // End Patch
 
     // emulate!
     printf_log(LOG_DEBUG, "Start x64emu on Main\n");
