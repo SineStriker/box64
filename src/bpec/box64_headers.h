@@ -6,7 +6,9 @@ static const char x64emu_headers[] = R"(
 #include <stdint.h>
 #include <pthread.h>
 
+//---------------------------------------------------------------------
 // regs.h
+//---------------------------------------------------------------------
 enum {
 	_RAX, _RCX, _RDX, _RBX,
 	_RSP, _RBP, _RSI, _RDI,
@@ -368,7 +370,10 @@ typedef union {
 
 
 
+//---------------------------------------------------------------------
 // x64emu_private.h
+//---------------------------------------------------------------------
+
 typedef struct box64context_s box64context_t;
 typedef struct x64_ucontext_s x64_ucontext_t;
 
